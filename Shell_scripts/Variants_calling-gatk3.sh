@@ -1,51 +1,123 @@
-#!/bin/bash
-
-Ref_dir="/home/liangyu/0_data/1_Genome"
-workdir="/home/liangyu/1_Project/5_Cotton/3_Varaiants_calling/0_trail" 
-BAM_dir="/home/liangyu/1_Project/5_Cotton/3_Varaiants_calling/0_BAM" 
-
-# Other settings
-nt=32 #number of threads to use in computation
-
+#! bin/bash
 
 
 #Build index and dict
-cd $Ref_dir
 samtools faidx $Ref_dir/Ghirsutum_527_v2.0.fa
-#bwa index $Ref_genome 
+bwa index $Ref_dir/Ghirsutum_527_v2.0.fa 
 picard CreateSequenceDictionary -R $Ref_dir/Ghirsutum_527_v2.0.fa -O $Ref_dir/Ghirsutum_527_v2.0.dict
 
-mkdir $workdir
-cd $workdir
+### set the thread numbers
+nt=14
 
 #loop settings
-for file in 203.R1 204.R1 205.R1 206.R1 207.R1 208.R1 209.R1 210.R1 211.R1 212.R1 213.R1 214.R1 215.R1 216.R1 217.R1 218.R1 219.R1 220.R1 221.R1 222.R1 223.R1 224.R1 225.R1 226.R1 228.R1 229.R1 230.R1 231.R1 232.R1 233.R1 234.R1 235.R1 236.R1 237.R1 238.R1 239.R1 240.R1 241.R1 242.R1 244.R1 245.R1;
+for file in $(cat $workdir/sample.list);
 do
- 	mkdir $file
-  	cd $file
+  mkdir ${workdir}/${file}
 
-	#Mark and remove duplictaes from Bam
-	picard MarkDuplicates -REMOVE_DUPLICATES true -I "/home/liangyu/1_Project/5_Cotton/3_Varaiants_calling/0_BAM/${file}.sorted.bam" -O ${file}.sort.dup.bam -M ${file}.metrics.txt 
+  ## Map reads by bwa piepline
+  bwa mem -M -R "@RG\tID:$file\tSM:$file\tPL:ILLUMINA" \
+    -t $nt  \
+    $Ref_dir/Ghirsutum_527_v2.0.fa \
+    ${BAM_dir}/${file}_forward_paired.fq.gz \
+    ${BAM_dir}/${file}_reverse_paired.fq.gz | samtools view -@10 -bS - -o ${workdir}/${file}/${file}.reorder.bam 
 
-	picard AddOrReplaceReadGroups -I ${file}.sort.dup.bam -O ${file}.sort.dup.Gr.bam -LB cotton -PL illumina -PU WL -SM ${file}
+  samtools view -b -F 4 ${workdir}/${file}/${file}.reorder.bam > ${workdir}/${file}/${file}.cut.bam
 
-	#index bam file
-	samtools index ${file}.sort.dup.Gr.bam
+  ## Sort bam files
+  picard SortSam \
+   INPUT=${workdir}/${file}/${file}.cut.bam \
+   OUTPUT=${workdir}/${file}/${file}.sort.bam SORT_ORDER=coordinate
 
-	#Transform the NCigarreads
-	java -Xmx128G -jar /home/liangyu/anaconda3/opt/gatk-3.8/GenomeAnalysisTK.jar -T SplitNCigarReads -R $Ref_dir/Ghirsutum_527_v2.0.fa -I ${file}.sort.dup.Gr.bam -o ${file}.sort.dup.Gr_NC.bam -rf ReassignOneMappingQuality -RMQF 255 -RMQT 60 -U ALLOW_N_CIGAR_READS
+    #Mark and remove duplictaes from Bam
+   picard MarkDuplicates -REMOVE_DUPLICATES true \
+    -I ${workdir}/${file}/${file}.sort.bam \
+    -O ${workdir}/${file}/${file}.sort.dup.bam \
+    -M ${workdir}/${file}/${file}.metrics.txt 
 
-	java -Xmx128G -jar /home/liangyu/anaconda3/opt/gatk-3.8/GenomeAnalysisTK.jar -T HaplotypeCaller -R $Ref_dir/Ghirsutum_527_v2.0.fa -I ${file}.sort.dup.Gr_NC.bam -nct 3 --emitRefConfidence GVCF -variant_index_type LINEAR -variant_index_parameter 128000 -o ${file}.gvcf
-	mv ${file}.gvcf $workdir
-	cd ..
+ #add group numbers and infotrmation
+  picard AddOrReplaceReadGroups \
+    -I ${workdir}/${file}/${file}.sort.dup.bam \
+    -O ${workdir}/${file}/${file}.sort.dup.Gr.bam -LB cotton -PL illumina -PU Diversity -SM ${file} &
+
+   #index bam file
+   samtools index ${workdir}/${file}/${file}.sort.dup.Gr.bam
+
+  java -Xmx128G -jar $GATK_dir/GenomeAnalysisTK.jar \
+    -T HaplotypeCaller \
+    -R $Ref_dir/Ghirsutum_527_v2.0.fa \
+    -I ${workdir}/${file}/${file}.sort.dup.Gr.bam \
+    -nct $nt --emitRefConfidence GVCF \
+    -variant_index_type LINEAR \
+    -variant_index_parameter 128000 \
+    -o ${workdir}/${file}/${file}.gvcf
+
+  mv ${workdir}/${file}/${file}.gvcf ${workdir}/
+
 done
 
-cd $workdir
-ls | grep ".gvcf" | sort > gvcf.list
+ls ${workdir} | grep ".gvcf" | sort > gvcf.list
 
-gatk3 -T CombineGVCFs -R $Ref_dir/Ghirsutum_527_v2.0.fa --variant $workdir/gvcf.list -o cotton.cohort.g.vcf
-gatk3 -T GenotypeGVCFs -R $Ref_dir/Ghirsutum_527_v2.0.fa --variant $workdir/cohort.g.vcf -o cotton_final.vcf
+### Generate the cohort VCFfiles
+java -Xmx128G -jar $GATK_dir/GenomeAnalysisTK.jar \
+ -T CombineGVCFs -nct $nt \
+ -R $Ref_dir/Ghirsutum_527_v2.0.fa \
+ --variant ${workdir}/gvcf.list 
+ -o cotton.cohort.gvcf \
+
+### Transform the VCFs format
+java -Xmx128G -jar $GATK_dir/GenomeAnalysisTK.jar \
+ -T GenotypeGVCFs -nct $nt \
+ -R $Ref_dir/Ghirsutum_527_v2.0.fa \
+ --variant $workdir/cohort.g.vcf -o cotton_DNA_genotype.vcf
+
+### Filter the variants of multiple samples
 
 
-#Filter VCF based on quality, depth, minor allele frequecny
-vcftools --vcf $workdir/cotton_final.vcf --max-missing 0.90 --maf 0.05 --min-alleles 2 --max-alleles 2 --minQ 20 --minDP 10 --recode --recode-INFO-all --out $workdir/cotton_final_filter.vcf
+workdir="/home/liangyu/1_Project/4_spinach/5_VCFs" 
+
+### STEP.1 remove loci with missing data based on cut-off to reduce bias of total mapping depth
+#keep loci with up to 10% missing data for plot
+vcftools --vcf $workdir/F1_map_variants.vcf \
+	--max-missing 0.90 --min-alleles 2 \
+	--recode --recode-INFO-all \
+	--out $workdir/F1_plot.vcf
+
+
+### STEP.2 PLOT DP, QD, and QUAL for each loci 
+###Extrat VCF depth information (This is the combined depth among samples)
+egrep -v "^#" $workdir/F1_plot.vcf.recode.vcf | \
+cut -f 8 | \
+sed 's/^.*;DP=\([0-9]*\);.*$/\1/' > $workdir/F1_map_DP.txt
+
+
+###Extrat VCF QualitybyDepth information 
+egrep -v "^#" $workdir/F1_plot.vcf.recode.vcf | \
+cut -f 8 | \
+sed 's/^.*;QD=\([0-9]*.[0-9]*\);.*$/\1/' > $workdir/F1_map_QD.txt
+
+###Extrat VCF Quality information
+egrep -v "^#" $workdir/F1_plot.vcf.recode.vcf | \
+cut -f 6 > $workdir/F1_map_QUAL.txt
+
+#Plot three component
+Rscript 1_Plot_depth_quality.R --DP $workdir/F1_map_DP.txt --QUAL $workdir/F1_map_QUAL.txt --QD $workdir/F1_map_QD.txt
+
+
+### STEP.3 Remove loci based on cutoff derived from plot information 
+## MinDP and MaxDP is determined by average total depth (total depth/population size)
+## minGQ=20: 1% chance that the call is incorrect
+## minQ=20: 1 % chance that there is no variant at the site
+
+vcftools --vcf $workdir/F1_plot.vcf.recode.vcf  \
+	--minDP 5 --maxDP 25 \
+	--minGQ 20 --minQ 20 \
+	--recode --recode-INFO-all \
+	--out $workdir/F1.vcf
+
+#filter based qualitybydepth (QD) (QD is the normalized quality based on mapping depth usually set as 2)
+vcffilter -f "QD > 5" $workdir/F1.vcf.recode.vcf > $workdir/F1_final_filter.vcf
+## Line NO. 1079049
+
+
+### STEP 4. extract genotype information only 
+cat $workdir/F1_final_filter.vcf | perl while (<>) { s!:\S+!!g; print; } > F1_final_filter.clean 
